@@ -3,7 +3,7 @@
 Auto-quarantine Illumio PCE workloads by label. Callable interactively by an
 operator or non-interactively by a SIEM/SOAR playbook (FortiSIEM primary).
 
-**Current release: v1.3.1** (bash).
+**Current release: v1.3.2** (bash, requires bash >= 4.3).
 
 > Future v2 (Python + HTTP webhook) is planned — see `docs/ROADMAP.md`.
 
@@ -196,9 +196,25 @@ parallel, dry_run, duration_ms, exit_code
 | 0 | Success (all matched workloads were updated or idempotently skipped) |
 | 2 | Partial failure (some PUTs failed; check `failed[]` in JSON) |
 | 3 | No managed workload matched any target |
-| 4 | PCE unreachable or auth failure |
-| 5 | Invalid input (bad flags, unknown label, ambiguous key/value) |
+| 4 | PCE unreachable, auth failure, or a sync collection GET hit the PCE 500-result cap |
+| 5 | Invalid input (bad flags, unknown label, malformed target term) |
 | 6 | Credentials missing |
+
+## Limitations
+
+- **PCE sync collection cap (500).** The PCE silently truncates synchronous
+  collection GETs to the latest 500 results. When a full workload scan
+  (CIDR/range/prefix targets) or a `labels?key=` lookup returns 500 items,
+  the script refuses to continue (exit 4) rather than risk quarantining on
+  partial data. Environments above the cap need async GET collections
+  (`Prefer: respond-async`) — planned for v2.
+- **Target validation is strict.** Malformed targets (bad CIDR, invalid
+  octets, reversed ranges, non-numeric prefix terms like `web01.`) exit 5
+  instead of silently matching nothing. CIDR host addresses are normalized
+  to their network (`10.0.0.5/24` → `10.0.0.0/24`).
+- **`--json` pre-flight errors.** Failures before the run starts (label
+  resolution, credential errors, truncation) print plain text to stderr and
+  emit no JSON on stdout — SIEM playbooks must key off the exit code.
 
 ## Tests
 
@@ -227,7 +243,7 @@ scripts/run_tests.sh tests/test_args.bats
 透過標籤自動隔離 Illumio PCE workloads。可由操作人員互動式呼叫，或透過 SIEM/SOAR
 playbook（主要為 FortiSIEM）非互動式呼叫。
 
-**目前版本：v1.3.1**（bash）。
+**目前版本：v1.3.2**（bash，需要 bash >= 4.3）。
 
 > 計畫推出未來的 v2（Python + HTTP webhook）— 請參閱 `docs/ROADMAP.md`。
 
@@ -417,9 +433,23 @@ parallel, dry_run, duration_ms, exit_code
 | 0 | 成功（所有相符的 workloads 皆已更新或以冪等方式略過） |
 | 2 | 部分失敗（部分 PUTs 失敗；請檢查 JSON 中的 `failed[]`） |
 | 3 | 沒有受管的 workload 匹配任何目標 |
-| 4 | PCE 無法連線或 auth 失敗 |
-| 5 | 無效的輸入（錯誤的 flags、未知 label、不明確的 key/value） |
+| 4 | PCE 無法連線、auth 失敗，或同步 collection GET 觸及 PCE 的 500 筆上限 |
+| 5 | 無效的輸入（錯誤的 flags、未知 label、格式錯誤的目標詞） |
 | 6 | 遺失 credentials |
+
+## 限制
+
+- **PCE 同步 collection 上限（500 筆）。** PCE 會將同步 collection GET 靜默
+  截斷為最新 500 筆。當全量 workload 掃描（CIDR/範圍/前綴目標）或
+  `labels?key=` 查詢回傳 500 筆時，腳本會拒絕繼續（exit 4），避免在不完整
+  的資料上執行隔離。超過上限的環境需要非同步 GET collections
+  （`Prefer: respond-async`）— 規劃於 v2 實作。
+- **目標詞嚴格驗證。** 格式錯誤的目標（無效 CIDR、非法 octet、起訖顛倒的
+  範圍、非數字前綴如 `web01.`）會以 exit 5 結束，而不是靜默不匹配。CIDR
+  主機位址會正規化為其網路位址（`10.0.0.5/24` → `10.0.0.0/24`）。
+- **`--json` 前期錯誤。** 執行開始前的失敗（label 解析、credentials 錯誤、
+  截斷防護）只會輸出純文字到 stderr，stdout 不會有 JSON — SIEM playbook
+  必須以 exit code 判斷。
 
 ## 測試
 

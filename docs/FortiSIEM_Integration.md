@@ -1,6 +1,6 @@
 # FortiSIEM — Illumio Quarantine Integration
 
-Wires `illumio-quarantine.sh` v1.3.1 into FortiSIEM 7.5 so that
+Wires `illumio-quarantine.sh` v1.3.2 into FortiSIEM 7.5 so that
 when an incident fires, the matching Illumio PCE workload is auto-quarantined
 by label.
 
@@ -16,7 +16,7 @@ by label.
 > `$incidentId`, `$ruleName`. Use ad-hoc "Remediate Incident" first, then
 > switch to Automation Policy once token expansion is confirmed.
 
-Shapes supported in v1.3.1:
+Shapes supported in v1.3.2:
 
 | Shape | Recommended? |
 |---|---|
@@ -229,11 +229,11 @@ Have FortiSIEM's Linux collector agent tail `/var/log/illumio_quarantine.cef`
 and forward as CEF. Parser mapping:
 
 ```
-Vendor=Illumio  Product=Quarantine  Version=1.3.1
+Vendor=Illumio  Product=Quarantine  Version=1.3.2
 EventId=quarantine.action  Severity=5
 cs1 → correlationId   cs2 → auditId       cs3 → reason
 cs4 → targets         cs5 → labelKey      cs6 → labelValue
-cs7 → dryRun          cn1 → updatedCount  cn2 → failedCount
+flexString1 → dryRun  cn1 → updatedCount  cn2 → failedCount
 ```
 
 With `correlationId ↔ incidentId`, FortiSIEM can auto-close the incident
@@ -248,8 +248,8 @@ when the success event arrives.
 | 0 | all matched, all quarantined | close incident |
 | 2 | partial (some failed) | flag for operator; re-fire with same `correlation-id` to retry |
 | 3 | no match (target not managed, unmanaged, or not in PCE) | note and close, or escalate |
-| 4 | PCE unreachable or auth failure | page on-call; check VPN / PCE health / creds |
-| 5 | invalid input (bad flags, unknown label, ambiguous key/value) | check rule template variables |
+| 4 | PCE unreachable, auth failure, or sync GET hit the PCE 500-result cap | page on-call; check VPN / PCE health / creds; if truncated, narrow targets |
+| 5 | invalid input (bad flags, unknown label, malformed target term) | check rule template variables |
 | 6 | credentials missing | check env vars / conf file / permissions |
 
 ---
@@ -293,7 +293,7 @@ application. Verify in the Illumio PCE GUI that the workload gains the
 
 # FortiSIEM — Illumio Quarantine 整合
 
-將 `illumio-quarantine.sh` v1.3.1 串接至 FortiSIEM 7.5 中，以便當 incident 觸發時，
+將 `illumio-quarantine.sh` v1.3.2 串接至 FortiSIEM 7.5 中，以便當 incident 觸發時，
 相符的 Illumio PCE workload 會透過標籤自動隔離。
 
 > **相容性注意事項。** FortiSIEM 7.5 的原廠文件並未明確說明 `$token` 替換是否適用於
@@ -305,7 +305,7 @@ application. Verify in the Illumio PCE GUI that the workload gains the
 > `$srcIpAddr`、`$incidentSrc`、`$incidentTarget`、`$incidentId`、`$ruleName`。
 > 請先使用特設的「Remediate Incident」，待確認 token 可成功展開後再切換至 Automation Policy。
 
-v1.3.1 支援的整合形式：
+v1.3.2 支援的整合形式：
 
 | 形式 | 是否推薦 |
 |---|---|
@@ -511,12 +511,15 @@ fortisiem-remediator ALL=(root) NOPASSWD: /opt/illumio_Quarantine/illumio-quaran
 並以 CEF 格式轉發。Parser 映射：
 
 ```
-Vendor=Illumio  Product=Quarantine  Version=1.3.1
+Vendor=Illumio  Product=Quarantine  Version=1.3.2
 EventId=quarantine.action  Severity=5
 cs1 → correlationId   cs2 → auditId       cs3 → reason
 cs4 → targets         cs5 → labelKey      cs6 → labelValue
-cs7 → dryRun          cn1 → updatedCount  cn2 → failedCount
+flexString1 → dryRun  cn1 → updatedCount  cn2 → failedCount
 ```
+
+> v1.3.2 將 `dryRun` 從非標準的 `cs7` 改為 `flexString1` —
+> CEF 標準只定義 `cs1`–`cs6`。既有的 parser 需同步更新。
 
 透過 `correlationId ↔ incidentId` 對應，當 success 事件到達時，FortiSIEM 可自動關閉該 incident。
 
@@ -529,8 +532,8 @@ cs7 → dryRun          cn1 → updatedCount  cn2 → failedCount
 | 0 | 全部相符，全部已隔離 | 關閉 incident |
 | 2 | 部分失敗（某些失敗） | 標記供操作人員檢視；以相同的 `correlation-id` 重新觸發來重試 |
 | 3 | 無相符項目（目標未受管、非受管或不在 PCE 中） | 註記並關閉，或升級處理 |
-| 4 | PCE 無法連線或 auth 失敗 | 呼叫 on-call；檢查 VPN / PCE 狀態 / creds |
-| 5 | 無效輸入（錯誤的 flags、未知 label、不明確的 key/value） | 檢查 rule template 變數 |
+| 4 | PCE 無法連線、auth 失敗，或同步 GET 觸及 PCE 500 筆上限 | 呼叫 on-call；檢查 VPN / PCE 狀態 / creds；若為截斷則縮小目標範圍 |
+| 5 | 無效輸入（錯誤的 flags、未知 label、格式錯誤的目標詞） | 檢查 rule template 變數 |
 | 6 | 遺失 credentials | 檢查 env vars / conf file / permissions |
 
 ---
