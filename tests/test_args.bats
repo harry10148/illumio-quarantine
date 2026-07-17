@@ -14,10 +14,10 @@ teardown() { common_teardown; }
     assert_output --partial "--insecure"
 }
 
-@test "--version prints 1.3.1" {
+@test "--version prints 1.3.2" {
     run bash "$SCRIPT" --version
     assert_success
-    assert_output --partial "1.3.1"
+    assert_output --partial "1.3.2"
 }
 
 @test "non-interactive without --targets exits 5" {

@@ -7,7 +7,7 @@
 #           添加/設置指定的 Label。
 # 作者:     Harry
 # 日期:     20250419
-# 版本:     1.3.1
+# 版本:     1.3.2
 #
 # 依賴套件:
 #   - curl:   用於發送 HTTP API 請求。
@@ -35,6 +35,7 @@ API_PASS=""
 PCE_URL_BASE=""
 ORG_ID=""
 CURL_AUTH_FILE=""
+RESULT_DIR=""
 
 # --- 輔助函數 ---
 
@@ -43,17 +44,17 @@ CURL_AUTH_FILE=""
 # @return integer 整數表示，如果輸入無效則返回 -1。
 ip_to_int() {
     local ip=$1
-    local o1 o2 o3 o4
+    local o1 o2 o3 o4 o
     IFS=. read -r o1 o2 o3 o4 <<< "$ip"
 
-    if [[ -z "$o1" || -z "$o2" || -z "$o3" || -z "$o4" ]] || \
-       ! [[ "$o1" =~ ^[0-9]+$ && "$o1" -le 255 ]] || \
-       ! [[ "$o2" =~ ^[0-9]+$ && "$o2" -le 255 ]] || \
-       ! [[ "$o3" =~ ^[0-9]+$ && "$o3" -le 255 ]] || \
-       ! [[ "$o4" =~ ^[0-9]+$ && "$o4" -le 255 ]]; then
-        echo "-1"; return 1
-    fi
-    echo $(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        # 10# forces base-10 so leading zeros are not parsed as octal
+        # ("08" would otherwise be a bash arithmetic error).
+        if ! [[ "$o" =~ ^[0-9]{1,3}$ ]] || (( 10#$o > 255 )); then
+            echo "-1"; return 1
+        fi
+    done
+    echo $(( (10#$o1 << 24) + (10#$o2 << 16) + (10#$o3 << 8) + 10#$o4 ))
     return 0
 }
 
@@ -107,6 +108,84 @@ is_ipv4_range_tilde() {
     s_int=$(ip_to_int "$s" || true)
     e_int=$(ip_to_int "$e" || true)
     [[ "$s_int" != "-1" && "$e_int" != "-1" ]]
+}
+
+# @description Normalize the network part of a CIDR term via ipcalc so a host
+#              address like 10.0.0.5/24 matches workloads in 10.0.0.0/24.
+# @param $1 CIDR term
+# @return prints normalized "network/prefix"; exit 1 if ipcalc rejects it
+normalize_cidr() {
+    local term="$1" net prefix out
+    IFS='/' read -r net prefix <<< "$term"
+    out=$(ipcalc -n "${net}/${prefix}" 2>/dev/null) || return 1
+    net=$(echo "$out" | grep -E '^(Network:|NETWORK=)' | head -n 1 \
+        | sed -E 's/^(Network:|NETWORK=)[[:space:]]*//; s|/.*||; s/[[:space:]]*$//')
+    [[ -n "$net" ]] || return 1
+    printf '%s/%s' "$net" "$prefix"
+}
+
+# @description Validate every search term and normalize in place.
+#              A quarantine run must not silently ignore a malformed target:
+#              invalid CIDR/IP/range/prefix terms exit 5 instead of matching
+#              nothing. Ranges tolerate spaces around the separator, and CIDR
+#              terms are rewritten to their network address.
+validate_search_terms() {
+    local i term t ip prefix s e sep o norm
+    for i in "${!SEARCH_TERMS[@]}"; do
+        term="${SEARCH_TERMS[$i]}"
+        [[ -z "$term" ]] && continue
+
+        # Tolerate spaces around range separators: "10.0.0.1 - 10.0.0.5"
+        if [[ "$term" =~ ^[0-9.[:space:]]+[-~][0-9.[:space:]]+$ ]]; then
+            term="${term// /}"
+            SEARCH_TERMS[$i]="$term"
+        fi
+
+        t=$(classify_term "$term")
+        case "$t" in
+            cidr)
+                IFS='/' read -r ip prefix <<< "$term"
+                if [[ "$(ip_to_int "$ip")" == "-1" ]] || \
+                   ! [[ "$prefix" =~ ^[0-9]{1,2}$ ]] || (( 10#$prefix > 32 )); then
+                    echo "ERROR: invalid CIDR target '${term}'" >&2; exit 5
+                fi
+                norm=$(normalize_cidr "$term") || {
+                    echo "ERROR: invalid CIDR target '${term}'" >&2; exit 5
+                }
+                SEARCH_TERMS[$i]="$norm"
+                ;;
+            range)
+                sep='-'
+                [[ "$term" == *~* ]] && sep='~'
+                IFS="$sep" read -r s e <<< "$term"
+                if (( $(ip_to_int "$s") > $(ip_to_int "$e") )); then
+                    echo "ERROR: invalid IP range '${term}' (start > end)" >&2; exit 5
+                fi
+                ;;
+            ip)
+                if [[ "$(ip_to_int "$term")" == "-1" ]]; then
+                    echo "ERROR: invalid IPv4 target '${term}'" >&2; exit 5
+                fi
+                ;;
+            prefix)
+                if ! [[ "$term" =~ ^([0-9]{1,3}\.){1,3}$ ]]; then
+                    echo "ERROR: invalid IP-prefix target '${term}'" >&2; exit 5
+                fi
+                for o in ${term//./ }; do
+                    if (( 10#$o > 255 )); then
+                        echo "ERROR: invalid IP-prefix target '${term}'" >&2; exit 5
+                    fi
+                done
+                ;;
+            hostname)
+                # A term made only of digits/dots/range separators that did
+                # not parse as IP/CIDR/range is a typo, not a hostname.
+                if [[ "$term" =~ ^[0-9.~-]+$ ]]; then
+                    echo "ERROR: invalid target '${term}' (not a valid IP/CIDR/range)" >&2; exit 5
+                fi
+                ;;
+        esac
+    done
 }
 
 load_credentials_file() {
@@ -213,6 +292,13 @@ load_credentials() {
     [[ -z "$API_USER" || -z "$API_PASS" ]] && exit 6
 }
 
+# Remove temp files created by this run (curl auth config, PUT result dir).
+# Installed as the EXIT/INT/TERM trap by init_curl_auth_file.
+cleanup_tmp_files() {
+    [[ -n "$CURL_AUTH_FILE" ]] && rm -f "$CURL_AUTH_FILE"
+    [[ -n "$RESULT_DIR" ]] && rm -rf "$RESULT_DIR"
+}
+
 # Write API_USER/API_PASS into a 0600 temp file and set up cleanup, so the
 # credentials are passed to curl via `-K $CURL_AUTH_FILE` and never appear in
 # /proc/<pid>/cmdline (where any local user could read them).
@@ -230,9 +316,9 @@ init_curl_auth_file() {
     umask "$old_umask"
     # Defensive chmod in case mktemp ignored umask on some platform.
     chmod 600 "$CURL_AUTH_FILE" 2>/dev/null || true
-    trap 'rm -f "$CURL_AUTH_FILE"' EXIT
-    trap 'rm -f "$CURL_AUTH_FILE"; trap - INT TERM; kill -INT $$' INT
-    trap 'rm -f "$CURL_AUTH_FILE"; trap - INT TERM; kill -TERM $$' TERM
+    trap 'cleanup_tmp_files' EXIT
+    trap 'cleanup_tmp_files; trap - INT TERM; kill -INT $$' INT
+    trap 'cleanup_tmp_files; trap - INT TERM; kill -TERM $$' TERM
     # curl -K config: `user = "user:pass"` with embedded quotes in the value
     # must be backslash-escaped per curl(1).
     local esc_user="${API_USER//\\/\\\\}"
@@ -250,6 +336,65 @@ SAME_KEY_HREFS_JSON="[]"
 
 _urlenc() {
     printf '%s' "$1" | jq -sRr @uri
+}
+
+# The PCE silently truncates synchronous collection GETs to the latest 500
+# results (larger collections require async jobs via `Prefer: respond-async`).
+PCE_SYNC_GET_MAX=500
+
+# @description GET a PCE URL, capturing body and HTTP status.
+#              Detects auth failure by status code (the PCE returns 401/403
+#              with a JSON *array* error body, so body-shape sniffing is
+#              unreliable). Exits 4 on network failure, 401/403, or any other
+#              non-2xx status not listed in $3.
+# @param $1 url
+# @param $2 context string for error messages
+# @param $3 optional space-separated non-2xx statuses to pass through
+# Sets: PCE_BODY, PCE_HTTP
+pce_get() {
+    local url="$1" ctx="$2" allow="${3:-}"
+    local out curl_ec s
+    out=$(curl ${CURL_OPTS} -K "$CURL_AUTH_FILE" \
+              -H 'Accept: application/json' \
+              -w '\n%{http_code}' "$url")
+    curl_ec=$?
+    if [[ $curl_ec -ne 0 ]]; then
+        echo "ERROR: PCE unreachable (curl exit $curl_ec) at ${ctx}" >&2
+        emit_cef "failure" 2>/dev/null || true
+        exit 4
+    fi
+    PCE_HTTP="${out##*$'\n'}"
+    PCE_BODY="${out%$'\n'*}"
+    if [[ "$PCE_HTTP" == "401" || "$PCE_HTTP" == "403" ]]; then
+        echo "ERROR: PCE authentication failed (HTTP ${PCE_HTTP}) at ${ctx}" >&2
+        emit_cef "failure" 2>/dev/null || true
+        exit 4
+    fi
+    if [[ "$PCE_HTTP" =~ ^2[0-9][0-9]$ ]]; then
+        return 0
+    fi
+    for s in $allow; do
+        [[ "$PCE_HTTP" == "$s" ]] && return 0
+    done
+    echo "ERROR: PCE returned HTTP ${PCE_HTTP} at ${ctx}" >&2
+    emit_cef "failure" 2>/dev/null || true
+    exit 4
+}
+
+# @description Fail hard when a synchronous collection GET returned
+#              PCE_SYNC_GET_MAX items — the result set may be silently
+#              truncated by the PCE and a quarantine run on partial data
+#              could miss targets.
+# @param $1 response body (JSON array)
+# @param $2 context string for the error message
+check_sync_truncation() {
+    local body="$1" ctx="$2" n
+    n=$(echo "$body" | jq 'length' 2>/dev/null || echo 0)
+    if [[ "$n" -ge "$PCE_SYNC_GET_MAX" ]]; then
+        echo "ERROR: PCE returned ${n} items for ${ctx}; synchronous collection GETs are truncated at ${PCE_SYNC_GET_MAX} so results may be incomplete. Refusing to continue — narrow the query or use async GET collections (Prefer: respond-async)." >&2
+        emit_cef "failure" 2>/dev/null || true
+        exit 4
+    fi
 }
 
 # @description Escape a value per ArcSight CEF (backslash, pipe, equals, CR, LF, space).
@@ -296,7 +441,8 @@ emit_cef() {
     fi
 
     local line
-    line=$(printf 'CEF:0|Illumio|Quarantine|%s|quarantine.action|Illumio Quarantine Action|5|rt=%s dvchost=%s act=%s outcome=%s cs1Label=correlation_id cs1=%s cs2Label=audit_id cs2=%s cs3Label=reason cs3=%s cs4Label=targets cs4=%s cs5Label=label_key cs5=%s cs6Label=label_value cs6=%s cn1Label=updated_count cn1=%d cn2Label=failed_count cn2=%d cs7Label=dry_run cs7=%s' \
+    # dry_run uses flexString1: CEF only defines custom strings cs1-cs6.
+    line=$(printf 'CEF:0|Illumio|Quarantine|%s|quarantine.action|Illumio Quarantine Action|5|rt=%s dvchost=%s act=%s outcome=%s cs1Label=correlation_id cs1=%s cs2Label=audit_id cs2=%s cs3Label=reason cs3=%s cs4Label=targets cs4=%s cs5Label=label_key cs5=%s cs6Label=label_value cs6=%s cn1Label=updated_count cn1=%d cn2Label=failed_count cn2=%d flexString1Label=dry_run flexString1=%s' \
         "$VERSION" "$epoch_ms" "$pce_host" "${UPDATE_MODE:-}" "$outcome" \
         "$esc_cid" "$AUDIT_ID" "$esc_reason" "$esc_targets" \
         "$esc_key" "$esc_val" \
@@ -314,42 +460,26 @@ emit_cef() {
 resolve_target_label() {
     local base="${PCE_URL_BASE}/api/${API_VERSION}/orgs/${ORG_ID}"
     if [[ -n "$LABEL_ID" ]]; then
-        local resp curl_ec
-        resp=$(curl ${CURL_OPTS} -K "$CURL_AUTH_FILE" \
-                   -H 'Accept: application/json' \
-                   "${base}/labels/${LABEL_ID}")
-        curl_ec=$?
-        if [[ $curl_ec -ne 0 || -z "$resp" ]]; then
-            echo "ERROR: PCE unreachable (curl exit $curl_ec) at ${base}/labels/${LABEL_ID}" >&2
-            emit_cef "failure" 2>/dev/null || true
-            exit 4
-        fi
-        if echo "$resp" | jq -e 'type=="object" and (has("error") or has("unauthorized"))' >/dev/null 2>&1; then
-            echo "ERROR: PCE authentication failed" >&2; emit_cef "failure"; exit 4
-        fi
-        if ! echo "$resp" | jq -e 'has("href")' >/dev/null 2>&1; then
+        pce_get "${base}/labels/${LABEL_ID}" "labels/${LABEL_ID}" "404"
+        if [[ "$PCE_HTTP" == "404" ]] || \
+           ! echo "$PCE_BODY" | jq -e 'type=="object" and has("href")' >/dev/null 2>&1; then
             echo "ERROR: label id ${LABEL_ID} not found" >&2
             exit 5
         fi
         TARGET_LABEL_HREF="/orgs/${ORG_ID}/labels/${LABEL_ID}"
-        TARGET_LABEL_KEY=$(echo   "$resp" | jq -r '.key')
-        TARGET_LABEL_VALUE=$(echo "$resp" | jq -r '.value')
+        TARGET_LABEL_KEY=$(echo   "$PCE_BODY" | jq -r '.key')
+        TARGET_LABEL_VALUE=$(echo "$PCE_BODY" | jq -r '.value')
     else
-        local resp enc_key curl_ec
+        local enc_key
         enc_key=$(_urlenc "$LABEL_KEY")
-        resp=$(curl ${CURL_OPTS} -K "$CURL_AUTH_FILE" \
-                   -H 'Accept: application/json' \
-                   "${base}/labels?key=${enc_key}")
-        curl_ec=$?
-        if [[ $curl_ec -ne 0 || -z "$resp" ]]; then
-            echo "ERROR: PCE unreachable (curl exit $curl_ec) at ${base}/labels?key=${enc_key}" >&2
-            emit_cef "failure" 2>/dev/null || true
+        pce_get "${base}/labels?key=${enc_key}" "labels?key=${enc_key}"
+        if ! echo "$PCE_BODY" | jq -e 'type=="array"' >/dev/null 2>&1; then
+            echo "ERROR: PCE response is not a JSON array for labels?key=${enc_key}" >&2
+            emit_cef "failure"
             exit 4
         fi
-        if echo "$resp" | jq -e 'type=="object" and (has("error") or has("unauthorized"))' >/dev/null 2>&1; then
-            echo "ERROR: PCE authentication failed" >&2; emit_cef "failure"; exit 4
-        fi
-        TARGET_LABEL_HREF=$(echo "$resp" | jq -r --arg v "$LABEL_VALUE" \
+        check_sync_truncation "$PCE_BODY" "labels?key=${LABEL_KEY}"
+        TARGET_LABEL_HREF=$(echo "$PCE_BODY" | jq -r --arg v "$LABEL_VALUE" \
             '[.[] | select(.value==$v)][0].href // empty')
         if [[ -z "$TARGET_LABEL_HREF" ]]; then
             echo "ERROR: no label with key=${LABEL_KEY} value=${LABEL_VALUE}" >&2
@@ -360,26 +490,16 @@ resolve_target_label() {
     fi
 
     # Fetch all hrefs sharing TARGET_LABEL_KEY (used by B2 same-key strip)
-    local same_resp enc_target_key curl_ec
+    local enc_target_key
     enc_target_key=$(_urlenc "$TARGET_LABEL_KEY")
-    same_resp=$(curl ${CURL_OPTS} -K "$CURL_AUTH_FILE" \
-                    -H 'Accept: application/json' \
-                    "${base}/labels?key=${enc_target_key}")
-    curl_ec=$?
-    if [[ $curl_ec -ne 0 || -z "$same_resp" ]]; then
-        echo "ERROR: PCE unreachable (curl exit $curl_ec) at ${base}/labels?key=${enc_target_key}" >&2
-        emit_cef "failure" 2>/dev/null || true
-        exit 4
-    fi
-    if echo "$same_resp" | jq -e 'type=="object" and (has("error") or has("unauthorized"))' >/dev/null 2>&1; then
-        echo "ERROR: PCE authentication failed" >&2; emit_cef "failure"; exit 4
-    fi
-    if ! echo "$same_resp" | jq -e 'type=="array"' >/dev/null 2>&1; then
+    pce_get "${base}/labels?key=${enc_target_key}" "labels?key=${enc_target_key}"
+    if ! echo "$PCE_BODY" | jq -e 'type=="array"' >/dev/null 2>&1; then
         echo "ERROR: PCE response is not a JSON array for labels?key=${enc_target_key}" >&2
         emit_cef "failure"
         exit 4
     fi
-    SAME_KEY_HREFS_JSON=$(echo "$same_resp" | jq -c '[.[].href]')
+    check_sync_truncation "$PCE_BODY" "labels?key=${TARGET_LABEL_KEY}"
+    SAME_KEY_HREFS_JSON=$(echo "$PCE_BODY" | jq -c '[.[].href]')
 }
 
 # @description Build PUT body, check idempotency, issue PUT, and classify outcome.
@@ -465,13 +585,17 @@ put_one_workload() {
 }
 
 # --- 依賴檢查 ---
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    echo >&2 "ERROR: bash >= 4.3 required (this script uses 'wait -n')."
+    exit 1
+fi
 command -v curl >/dev/null 2>&1 || { echo >&2 "ERROR: required package 'curl' not installed. Please install it first."; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo >&2 "ERROR: required package 'jq' not installed. Please install it first."; exit 1; }
 command -v ipcalc >/dev/null 2>&1 || { echo >&2 "ERROR: required package 'ipcalc' not installed. Please install it first."; exit 1; }
 
 
 # --- CLI argument parsing ---
-VERSION="1.3.1"
+VERSION="1.3.2"
 
 require_arg() {
     if [[ $# -lt 2 || "$2" == --* ]]; then
@@ -532,7 +656,7 @@ Env vars (after --credentials-file, before defaults):
   ILLUMIO_QUARANTINE_AUDIT_FILE
 
 Exit codes:
-  0 success | 2 partial | 3 no match | 4 auth fail | 5 input error | 6 no creds
+  0 success | 2 partial | 3 no match | 4 auth fail / PCE unreachable or truncated | 5 input error | 6 no creds
 USAGE
 }
 
@@ -603,6 +727,18 @@ if [[ "$JSON_OUT" == "1" && "$NON_INTERACTIVE" != "1" ]]; then
     exit 5
 fi
 
+# Run-state accumulators for JSON emission — declared before any code path
+# that can call emit_cef (which reads AUDIT_ID and the J_* arrays).
+AUDIT_ID="qr-$(date -u +%Y-%m-%dT%H-%M-%SZ)-$(printf '%04x%02x' $((RANDOM)) $((RANDOM%256)))"
+RUN_START_MS=$(date +%s%3N)
+declare -a J_REQUESTED=()
+declare -a J_MATCHED=()
+declare -a J_UPDATED=()
+declare -a J_SKIPPED=()
+declare -a J_FAILED=()
+
+hlog() { [[ "$JSON_OUT" != "1" ]] && echo "$@"; }
+
 load_credentials
 init_curl_auth_file
 
@@ -640,18 +776,6 @@ if [[ "$JSON_OUT" != "1" ]]; then
     [[ -n "$REASON"         ]] && echo "reason=$REASON"
 fi
 
-# Run-state accumulators for JSON emission
-AUDIT_ID="qr-$(date -u +%Y-%m-%dT%H-%M-%SZ)-$(printf '%04x%02x' $((RANDOM)) $((RANDOM%256)))"
-RUN_START_MS=$(date +%s%3N)
-declare -a J_REQUESTED=()
-declare -a J_MATCHED=()
-declare -a J_UPDATED=()
-declare -a J_SKIPPED=()
-declare -a J_FAILED=()
-
-hlog() { [[ "$JSON_OUT" != "1" ]] && echo "$@"; }
-
-
 # --- 輸入解析 ---
 IFS=',' read -ra SEARCH_TERMS <<< "$SEARCH_TERMS_RAW"
 for i in "${!SEARCH_TERMS[@]}"; do
@@ -659,11 +783,14 @@ for i in "${!SEARCH_TERMS[@]}"; do
     SEARCH_TERMS[$i]=$(echo "${SEARCH_TERMS[$i]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 done
 
-# Seed J_REQUESTED from SEARCH_TERMS
+# Seed J_REQUESTED from SEARCH_TERMS (raw, before normalization)
 for t in "${SEARCH_TERMS[@]}"; do
     [[ -z "$t" ]] && continue
     J_REQUESTED+=("$(jq -nc --arg t "$t" '$t')")
 done
+
+# Reject malformed targets and normalize CIDR/range terms in place
+validate_search_terms
 
 
 # --- Step 1: Fetch workloads (server-side per-term if all precise, else one full scan) ---
@@ -681,9 +808,10 @@ done
 
 if [[ "$needs_full" == "1" ]]; then
     SEARCH_STRATEGY="full_scan"
-    api_response=$(curl ${CURL_OPTS} -K "$CURL_AUTH_FILE" \
-        -H 'Accept: application/json' \
-        "${WORKLOADS_BASE}?max_results=100000")
+    # Sync collection GETs are capped at PCE_SYNC_GET_MAX by the PCE anyway;
+    # requesting more only hides the truncation.
+    pce_get "${WORKLOADS_BASE}?max_results=${PCE_SYNC_GET_MAX}" "workloads full scan"
+    api_response="$PCE_BODY"
 else
     SEARCH_STRATEGY="server_side"
     api_response="[]"
@@ -692,32 +820,27 @@ else
         t=$(classify_term "$term")
         enc_term=$(_urlenc "$term")
         if [[ "$t" == "ip" ]]; then
-            part=$(curl ${CURL_OPTS} -K "$CURL_AUTH_FILE" \
-                -H 'Accept: application/json' \
-                "${WORKLOADS_BASE}?ip_address=${enc_term}")
+            pce_get "${WORKLOADS_BASE}?ip_address=${enc_term}" "workloads?ip_address=${term}"
         else
-            part=$(curl ${CURL_OPTS} -K "$CURL_AUTH_FILE" \
-                -H 'Accept: application/json' \
-                "${WORKLOADS_BASE}?hostname=${enc_term}")
+            pce_get "${WORKLOADS_BASE}?hostname=${enc_term}" "workloads?hostname=${term}"
         fi
+        part="$PCE_BODY"
         if ! echo "$part" | jq -e 'type=="array"' >/dev/null 2>&1; then
             echo "ERROR: PCE returned non-array for term '${term}'" >&2; exit 4
         fi
+        check_sync_truncation "$part" "term '${term}'"
         # Merge (dedup by href)
         api_response=$(jq -n --argjson a "$api_response" --argjson b "$part" \
             '$a + $b | unique_by(.href)')
     done
 fi
 
-# Auth / JSON validation
-if ! echo "$api_response" | jq empty >/dev/null 2>&1; then
-    echo "ERROR: PCE response is not valid JSON" >&2; emit_cef "failure"; exit 4
-fi
-if echo "$api_response" | jq -e 'type=="object" and (has("error") or has("unauthorized"))' >/dev/null 2>&1; then
-    echo "ERROR: PCE authentication failed" >&2; emit_cef "failure"; exit 4
-fi
-if ! echo "$api_response" | jq -e 'type=="array"' >/dev/null; then
+# JSON validation (auth failures are already caught by status code in pce_get)
+if ! echo "$api_response" | jq -e 'type=="array"' >/dev/null 2>&1; then
     echo "ERROR: PCE response is not a JSON array" >&2; emit_cef "failure"; exit 4
+fi
+if [[ "$SEARCH_STRATEGY" == "full_scan" ]]; then
+    check_sync_truncation "$api_response" "workloads full scan"
 fi
 
 
@@ -727,112 +850,64 @@ hlog "Analyzing matching workloads (managed: true only)..."
 declare -A workloads_to_update # 存儲待更新 Workloads (鍵: href, 值: json{hostname, labels})
 found_count=0                  # 唯一匹配的 Workload 計數
 
+# 先用單次 jq 展平成 TSV（每個 managed Workload 一行:
+# href、hostname、public_ip、空白分隔的介面 IP、labels JSON），
+# 避免在外層循環中對每個 Workload 反覆呼叫 jq。
+flat_workloads=$(echo "$api_response" | jq -r '
+    .[]?
+    | select(type == "object")
+    | select((.href // "") != "")
+    | select(.managed == true)
+    | [ .href,
+        (.hostname // "N/A"),
+        (.public_ip // ""),
+        ([.interfaces[]?.address | strings] | join(" ")),
+        ([.labels[]? | {href}] | tostring) ]
+    | @tsv')
+
 # --- 外層循環: 遍歷 Workloads ---
-while IFS= read -r workload_json; do
-    # 驗證讀取的行是否為有效 JSON 對象
-    if ! echo "$workload_json" | jq -e 'type == "object"' > /dev/null; then continue; fi
-
-    # 提取 href (必需)
-    workload_href=$(echo "$workload_json" | jq -r '.href // empty')
-    if [[ -z "$workload_href" ]]; then continue; fi
-
-    # 過濾器: 檢查 managed 狀態
-    is_managed=$(echo "$workload_json" | jq -r '.managed // "false"')
-    if [[ "$is_managed" != "true" ]]; then continue; fi
-
-    # 提取其他所需信息
-    hostname=$(echo "$workload_json" | jq -r '.hostname // "N/A"')
-    public_ip=$(echo "$workload_json" | jq -r '.public_ip // empty')
-    interfaces_json=$(echo "$workload_json" | jq -c '.interfaces // []')
-    labels_json=$(echo "$workload_json" | jq -c '[.labels[]? | {href: .href}] // []')
+while IFS=$'\t' read -r workload_href hostname public_ip addrs labels_json; do
+    [[ -z "$workload_href" ]] && continue
+    [[ -z "$labels_json" ]] && labels_json="[]"
 
     match_found_for_this_workload=false
 
     # --- 內層循環: 遍歷搜索條件 ---
     for term in "${SEARCH_TERMS[@]}"; do
+        [[ -z "$term" ]] && continue
         term_matched_current_workload=false
 
-        # 1. CIDR 匹配
+        # 1. CIDR 匹配 (input 已由 validate_search_terms 正規化為網路位址)
         if [[ "$term" == */* ]]; then
             IFS='/' read -r input_network input_prefix <<< "$term"
-            if [[ "$input_prefix" =~ ^[0-9]+$ ]] && [[ $input_prefix -le 32 ]]; then
-                 # 檢查 Public IP
-                 if [[ -n "$public_ip" && "$public_ip" != "null" ]]; then
-                     calculated_network_output=$(ipcalc -n "${public_ip}/${input_prefix}" 2>/dev/null)
-                     if [[ $? -eq 0 ]]; then
-                         calculated_network=$(echo "$calculated_network_output" | grep -E '^(Network:|NETWORK=)' | head -n 1 | sed -E 's/^(Network:|NETWORK=)[[:space:]]*//; s|/.*||; s/[[:space:]]*$//')
-                         if [[ -n "$calculated_network" && "$calculated_network" == "$input_network" ]]; then term_matched_current_workload=true; fi
-                     fi
-                 fi
-                 # 檢查 Interface IPs (僅當 Public IP 不匹配)
-                 if ! $term_matched_current_workload && [[ "$interfaces_json" != "[]" ]]; then
-                     while IFS= read -r if_addr <&3; do
-                         if_addr=$(echo "$if_addr" | jq -r '.')
-                         if [[ -n "$if_addr" && "$if_addr" != "null" ]]; then
-                            calculated_network_output=$(ipcalc -n "${if_addr}/${input_prefix}" 2>/dev/null)
-                            if [[ $? -eq 0 ]]; then
-                                calculated_network=$(echo "$calculated_network_output" | grep -E '^(Network:|NETWORK=)' | head -n 1 | sed -E 's/^(Network:|NETWORK=)[[:space:]]*//; s|/.*||; s/[[:space:]]*$//')
-                                if [[ -n "$calculated_network" && "$calculated_network" == "$input_network" ]]; then term_matched_current_workload=true; break; fi
-                            fi
-                         fi
-                     done 3< <(echo "$interfaces_json" | jq -c '.[].address') # 使用 FD 3 讀取接口 IP
-                 fi
-            fi
-        # 2. 範圍匹配 (-)  (hostnames starting with a letter are not ranges)
-        elif is_ipv4_range_dash "$term"; then
-            IFS='-' read -r range_start range_end <<< "$term"
-            range_start=$(echo "$range_start" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            range_end=$(echo "$range_end" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            # 檢查 Public IP
-            if [[ -n "$public_ip" && "$public_ip" != "null" ]]; then
-                if is_in_range "$public_ip" "$range_start" "$range_end"; then term_matched_current_workload=true; fi
-            fi
-            # 檢查 Interface IPs
-            if ! $term_matched_current_workload && [[ "$interfaces_json" != "[]" ]]; then
-                while IFS= read -r if_addr <&3; do
-                    if_addr=$(echo "$if_addr" | jq -r '.')
-                    if [[ -n "$if_addr" && "$if_addr" != "null" ]]; then
-                        if is_in_range "$if_addr" "$range_start" "$range_end"; then term_matched_current_workload=true; break; fi
-                    fi
-                done 3< <(echo "$interfaces_json" | jq -c '.[].address')
-            fi
-        # 3. 範圍匹配 (~)
-        elif is_ipv4_range_tilde "$term"; then
-             IFS='~' read -r range_start range_end <<< "$term"
-             range_start=$(echo "$range_start" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-             range_end=$(echo "$range_end" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-             # 檢查 Public IP
-             if [[ -n "$public_ip" && "$public_ip" != "null" ]]; then
-                 if is_in_range "$public_ip" "$range_start" "$range_end"; then term_matched_current_workload=true; fi
-             fi
-             # 檢查 Interface IPs
-             if ! $term_matched_current_workload && [[ "$interfaces_json" != "[]" ]]; then
-                 while IFS= read -r if_addr <&3; do
-                     if_addr=$(echo "$if_addr" | jq -r '.')
-                     if [[ -n "$if_addr" && "$if_addr" != "null" ]]; then
-                         if is_in_range "$if_addr" "$range_start" "$range_end"; then term_matched_current_workload=true; break; fi
-                     fi
-                 done 3< <(echo "$interfaces_json" | jq -c '.[].address')
-             fi
+            for cand in $public_ip $addrs; do
+                calculated_network_output=$(ipcalc -n "${cand}/${input_prefix}" 2>/dev/null) || continue
+                calculated_network=$(echo "$calculated_network_output" | grep -E '^(Network:|NETWORK=)' | head -n 1 | sed -E 's/^(Network:|NETWORK=)[[:space:]]*//; s|/.*||; s/[[:space:]]*$//')
+                if [[ -n "$calculated_network" && "$calculated_network" == "$input_network" ]]; then
+                    term_matched_current_workload=true; break
+                fi
+            done
+        # 2./3. 範圍匹配 (- 或 ~)
+        elif is_ipv4_range_dash "$term" || is_ipv4_range_tilde "$term"; then
+            range_sep='-'
+            [[ "$term" == *~* ]] && range_sep='~'
+            IFS="$range_sep" read -r range_start range_end <<< "$term"
+            for cand in $public_ip $addrs; do
+                if is_in_range "$cand" "$range_start" "$range_end"; then
+                    term_matched_current_workload=true; break
+                fi
+            done
         # 4. 其他 (主機名 / 精確 IP / 前綴)
         else
-            # 檢查主機名
-            if [[ "$hostname" == "$term" ]]; then term_matched_current_workload=true; fi
-            # 檢查 Public IP
-            if ! $term_matched_current_workload && [[ "$public_ip" == "$term" ]]; then term_matched_current_workload=true; fi
-            # 檢查 Interface IPs
-            if ! $term_matched_current_workload && [[ "$interfaces_json" != "[]" ]]; then
+            if [[ "$hostname" == "$term" ]]; then
+                term_matched_current_workload=true
+            else
                 is_prefix=false
-                if [[ "$term" == *. ]]; then is_prefix=true; fi # 判斷是否為前綴
-                while IFS= read -r if_addr <&3; do
-                    if_addr=$(echo "$if_addr" | jq -r '.')
-                    if [[ -n "$if_addr" && "$if_addr" != "null" ]]; then
-                        # 精確匹配
-                        if [[ "$if_addr" == "$term" ]]; then term_matched_current_workload=true; break; fi
-                        # 前綴匹配
-                        if $is_prefix && [[ "$if_addr" == "$term"* ]]; then term_matched_current_workload=true; break; fi
-                    fi
-                done 3< <(echo "$interfaces_json" | jq -c '.[].address')
+                [[ "$term" == *. ]] && is_prefix=true
+                for cand in $public_ip $addrs; do
+                    if [[ "$cand" == "$term" ]]; then term_matched_current_workload=true; break; fi
+                    if $is_prefix && [[ "$cand" == "$term"* ]]; then term_matched_current_workload=true; break; fi
+                done
             fi
         fi # --- 結束條件匹配 ---
 
@@ -856,7 +931,7 @@ while IFS= read -r workload_json; do
         fi
         workloads_to_update["$key"]="$value_json" # 存儲或更新信息
     fi
-done < <(echo "$api_response" | jq -c '.[]') # --- 結束外層循環 ---
+done <<< "$flat_workloads" # --- 結束外層循環 ---
 
 
 # --- 步驟 3: 確認 ---
@@ -880,15 +955,8 @@ for key in "${!workloads_to_update[@]}"; do
 done
 hlog "--------------------------------------------------"
 
-if [[ "$NON_INTERACTIVE" != "1" && ${#workloads_to_update[@]} -gt 0 ]]; then
-    read -e -p "Continue? (type 'yes' to confirm): " CONFIRMATION
-    if [[ "${CONFIRMATION,,}" != "yes" ]]; then
-        hlog "Cancelled."
-        exit 0
-    fi
-fi
-
-if [[ "$NON_INTERACTIVE" != "1" && -z "$UPDATE_MODE" ]]; then
+# 先選模式再確認：overwrite 具破壞性，用戶必須在按下 yes 前知道將用哪種模式
+if [[ "$NON_INTERACTIVE" != "1" && -z "$UPDATE_MODE" && ${#workloads_to_update[@]} -gt 0 ]]; then
     echo "Label update mode:"
     echo "  1) append    (keep existing business labels; replace same-key)"
     echo "  2) overwrite (remove all existing labels; set only new)"
@@ -901,6 +969,15 @@ if [[ "$NON_INTERACTIVE" != "1" && -z "$UPDATE_MODE" ]]; then
 fi
 [[ -z "$UPDATE_MODE" ]] && UPDATE_MODE="append"
 
+if [[ "$NON_INTERACTIVE" != "1" && ${#workloads_to_update[@]} -gt 0 ]]; then
+    hlog "mode: ${UPDATE_MODE}"
+    read -e -p "Continue? (type 'yes' to confirm): " CONFIRMATION
+    if [[ "${CONFIRMATION,,}" != "yes" ]]; then
+        hlog "Cancelled."
+        exit 0
+    fi
+fi
+
 hlog "--------------------------------------------------"
 
 
@@ -908,7 +985,9 @@ hlog "--------------------------------------------------"
 # 遍歷確認要更新的 Workload 並發送 API 請求
 
 hlog "Updating labels (parallel=${PARALLEL})..."
-RESULT_DIR=$(mktemp -d "/tmp/iq_results_XXXXXX")
+RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/iq_results_XXXXXX") || {
+    echo "ERROR: failed to create results temp dir" >&2; exit 1
+}
 active=0
 for key in "${!workloads_to_update[@]}"; do
     workload_href=$(echo "$key" | tr '_' '/')

@@ -1,6 +1,33 @@
 # illumio_Quarantine Roadmap
 
-## v1.3.1 — bash, FortiSIEM-ready (this release)
+## v1.3.2 — correctness against real PCE API behavior (this release)
+
+Driven by a full code review verified against Illumio PCE API documentation:
+
+- **Sync-truncation guard**: the PCE silently caps synchronous collection
+  GETs at 500 results. Full scans and `labels?key=` lookups now fail hard
+  (exit 4) at the cap instead of quarantining on partial data; full scan
+  requests `max_results=500` honestly. Async GET collections deferred to v2.
+- **Status-code auth detection**: real PCE auth errors are HTTP 401/403 with
+  a JSON *array* body (`[{"token":...,"message":...}]`), which the old
+  object-shape check never matched (auth failures were misreported as exit
+  3/5). All GETs now go through `pce_get` and branch on the HTTP status;
+  the curl mock emits the real PCE error shape.
+- **Strict target validation**: malformed CIDR/IP/range/prefix terms exit 5
+  instead of silently matching nothing; ranges tolerate spaces around the
+  separator; reversed ranges rejected; digits-and-dots garbage rejected.
+- **CIDR normalization**: host addresses like `10.0.0.5/24` normalize to
+  `10.0.0.0/24` before matching.
+- **Decimal octet parsing**: leading-zero octets no longer parsed as octal
+  (`08`/`09` previously caused bash arithmetic errors).
+- **CEF**: `dry_run` moved from non-standard `cs7` to `flexString1`.
+- Matching loop pre-flattens workloads with a single jq pass (one process
+  per scan instead of ~6 per workload).
+- Result temp dir honors `$TMPDIR` and is cleaned by EXIT/INT/TERM traps;
+  bash >= 4.3 enforced at startup; interactive flow now picks the update
+  mode *before* the final confirmation.
+
+## v1.3.1 — bash, FortiSIEM-ready
 
 Scope:
 - Non-interactive CLI: `--non-interactive`, `--json`, `--dry-run`
@@ -74,7 +101,30 @@ illumio_quarantine/
 
 # illumio_Quarantine 發展藍圖
 
-## v1.3.1 — bash，支援 FortiSIEM（本次發布）
+## v1.3.2 — 針對真實 PCE API 行為的正確性修正（本次發布）
+
+源自一次以 Illumio PCE API 文件驗證的完整 code review：
+
+- **同步截斷防護**：PCE 會將同步 collection GET 靜默截斷為 500 筆。全量掃描
+  與 `labels?key=` 查詢在觸及上限時改為硬性失敗（exit 4），不再冒著以不完整
+  資料執行隔離的風險；全量掃描誠實地請求 `max_results=500`。非同步 GET
+  collections 延後至 v2。
+- **以狀態碼偵測認證失敗**：真實 PCE 認證錯誤是 HTTP 401/403 加上 JSON
+  「陣列」錯誤體（`[{"token":...,"message":...}]`），舊的物件形狀檢查永遠不會
+  命中（認證失敗會被誤報為 exit 3/5）。所有 GET 改走 `pce_get` 並以 HTTP
+  狀態碼分流；curl mock 改為輸出真實 PCE 錯誤格式。
+- **目標詞嚴格驗證**：格式錯誤的 CIDR/IP/範圍/前綴以 exit 5 結束，不再靜默
+  不匹配；範圍容忍分隔符前後空白；拒絕起訖顛倒的範圍與純數字點號垃圾輸入。
+- **CIDR 正規化**：`10.0.0.5/24` 等主機位址在匹配前正規化為 `10.0.0.0/24`。
+- **十進位 octet 解析**：前導零不再被當作八進位（`08`/`09` 先前會觸發 bash
+  算術錯誤）。
+- **CEF**：`dry_run` 從非標準的 `cs7` 改為 `flexString1`。
+- 匹配迴圈改以單次 jq 預先展平（每次掃描一個行程，取代先前每個 workload
+  約 6 個）。
+- 結果暫存目錄尊重 `$TMPDIR` 並由 EXIT/INT/TERM trap 清理；啟動時強制要求
+  bash >= 4.3；互動流程改為在最終確認「之前」選擇更新模式。
+
+## v1.3.1 — bash，支援 FortiSIEM
 
 範圍：
 - 非互動式 CLI：`--non-interactive`、`--json`、`--dry-run`
