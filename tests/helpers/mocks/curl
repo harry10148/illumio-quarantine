@@ -2,15 +2,17 @@
 # Mock curl for bats tests.
 #   MOCK_CURL_LOG           path for call log (TSV: method\turl\tdata)
 #   MOCK_CURL_FIXTURE_DIR   tests/fixtures
-#   MOCK_CURL_AUTH_FAIL     "1" → GET /workloads* returns 401 object
-#   MOCK_CURL_AUTH_FAIL_LABELS_KEY "1" → GET /labels?key=* returns 401 object
+#   MOCK_CURL_AUTH_FAIL     "1" → ANY GET returns HTTP 401 + PCE error array
+#   MOCK_CURL_AUTH_FAIL_LABELS_KEY "1" → GET /labels?key=* returns HTTP 401
+#   MOCK_CURL_WL_COUNT      generate N managed workloads for /workloads GETs
+#   MOCK_CURL_LABELS_COUNT  generate N labels for /labels?key= GETs
 #   MOCK_CURL_PUT_HTTP      override PUT HTTP code (default 204)
 #   MOCK_CURL_PUT_DELAY_MS  artificial per-PUT delay (parallel test)
 #   MOCK_CURL_PUT_HTTP_FIRST_FAIL "1" → first PUT returns 403, rest 204
 
 set -euo pipefail
 
-method="GET"; url=""; data=""
+method="GET"; url=""; data=""; wfmt=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -X) method="$2"; shift 2 ;;
@@ -18,7 +20,7 @@ while [[ $# -gt 0 ]]; do
         -u|-H) shift 2 ;;
         -K) shift 2 ;;
         -o) shift 2 ;;
-        -w) shift 2 ;;
+        -w) wfmt="$2"; shift 2 ;;
         -s|-k) shift ;;
         --*) shift ;;
         *) url="$1"; shift ;;
@@ -28,51 +30,82 @@ done
 ts=$(date +%s%3N)
 printf '%s\t%s\t%s\t%s\n' "$method" "$url" "$data" "$ts" >> "$MOCK_CURL_LOG"
 
+# Real PCE error payloads are a JSON ARRAY of {token,message} objects.
+PCE_AUTH_ERROR='[{"token":"authentication_failure","message":"Invalid credentials"}]'
+
+# Print body, then honor `-w ...%{http_code}` by appending newline + code
+# (mirrors the script's `-w '\n%{http_code}'` GET contract).
+respond() {
+    local body="$1" code="$2"
+    printf '%s' "$body"
+    if [[ "$wfmt" == *"%{http_code}"* ]]; then
+        printf '\n%s' "$code"
+    fi
+    exit 0
+}
+
+gen_workloads() {
+    jq -nc --argjson n "$1" '[range($n) | {
+        href: ("/orgs/1/workloads/gen-" + tostring),
+        hostname: ("gen-" + tostring + ".lab.local"),
+        public_ip: null,
+        managed: true,
+        interfaces: [{address: ("10.99." + ((. / 250) | floor | tostring) + "." + ((. % 250) | tostring))}],
+        labels: []
+    }]'
+}
+
+gen_labels() {
+    jq -nc --argjson n "$1" '[range($n) | {
+        href: ("/orgs/1/labels/" + ((1000 + .) | tostring)),
+        key: "Quarantine",
+        value: ("v" + tostring)
+    }]'
+}
+
 # Unreachable short-circuit: simulate network failure on ANY GET
 if [[ "$method" == "GET" && "${MOCK_CURL_UNREACHABLE:-0}" == "1" ]]; then
     exit 7
 fi
 
-# Auth-fail short-circuit: return unauthorized object on ANY GET
+# Auth-fail short-circuit: HTTP 401 + PCE-style error array on ANY GET
 if [[ "$method" == "GET" && "${MOCK_CURL_AUTH_FAIL:-0}" == "1" ]]; then
-    echo -n '{"error":"unauthorized"}'; exit 0
+    respond "$PCE_AUTH_ERROR" 401
 fi
 
 if [[ "$method" == "GET" && "$url" == *"/labels?key="* && "${MOCK_CURL_AUTH_FAIL_LABELS_KEY:-0}" == "1" ]]; then
-    echo -n '{"error":"unauthorized"}'; exit 0
+    respond "$PCE_AUTH_ERROR" 401
 fi
 
 case "$method:$url" in
     GET:*"/labels?key="*)
-        cat "$MOCK_CURL_FIXTURE_DIR/labels_by_key.json"; exit 0 ;;
+        if [[ -n "${MOCK_CURL_LABELS_COUNT:-}" ]]; then
+            respond "$(gen_labels "$MOCK_CURL_LABELS_COUNT")" 200
+        fi
+        respond "$(cat "$MOCK_CURL_FIXTURE_DIR/labels_by_key.json")" 200 ;;
     GET:*"/labels/"*)
-        cat "$MOCK_CURL_FIXTURE_DIR/label_by_id.json"; exit 0 ;;
+        respond "$(cat "$MOCK_CURL_FIXTURE_DIR/label_by_id.json")" 200 ;;
     GET:*"/workloads?"*"ip_address="*|GET:*"/workloads?"*"hostname="*)
         q="${url#*\?}"
         ip="$(echo "$q" | tr '&' '\n' | awk -F= '$1=="ip_address"{print $2}')"
         hn="$(echo "$q" | tr '&' '\n' | awk -F= '$1=="hostname"{print $2}')"
         if [[ -n "$ip" ]]; then
-            jq --arg ip "$ip" '[.[] | select(.public_ip==$ip or (.interfaces[]?.address==$ip))]' \
-                "$MOCK_CURL_FIXTURE_DIR/workloads_list.json"
+            body=$(jq --arg ip "$ip" '[.[] | select(.public_ip==$ip or (.interfaces[]?.address==$ip))]' \
+                "$MOCK_CURL_FIXTURE_DIR/workloads_list.json")
         elif [[ -n "$hn" ]]; then
-            jq --arg h "$hn" '[.[] | select(.hostname==$h)]' \
-                "$MOCK_CURL_FIXTURE_DIR/workloads_list.json"
+            body=$(jq --arg h "$hn" '[.[] | select(.hostname==$h)]' \
+                "$MOCK_CURL_FIXTURE_DIR/workloads_list.json")
         else
-            echo "[]"
+            body="[]"
         fi
-        exit 0 ;;
-    GET:*"/workloads?max_results="*|GET:*"/workloads?"*"max_results="*)
-        if [[ "${MOCK_CURL_AUTH_FAIL:-0}" == "1" ]]; then
-            echo -n '{"error":"unauthorized"}'; exit 0
+        respond "$body" 200 ;;
+    GET:*"/workloads?max_results="*|GET:*"/workloads?"*"max_results="*|GET:*"/workloads")
+        if [[ -n "${MOCK_CURL_WL_COUNT:-}" ]]; then
+            respond "$(gen_workloads "$MOCK_CURL_WL_COUNT")" 200
         fi
-        cat "$MOCK_CURL_FIXTURE_DIR/workloads_list.json"; exit 0 ;;
-    GET:*"/workloads")
-        if [[ "${MOCK_CURL_AUTH_FAIL:-0}" == "1" ]]; then
-            echo -n '{"error":"unauthorized"}'; exit 0
-        fi
-        cat "$MOCK_CURL_FIXTURE_DIR/workloads_list.json"; exit 0 ;;
+        respond "$(cat "$MOCK_CURL_FIXTURE_DIR/workloads_list.json")" 200 ;;
     GET:*"/workloads/"*)
-        cat "$MOCK_CURL_FIXTURE_DIR/single_workload.json"; exit 0 ;;
+        respond "$(cat "$MOCK_CURL_FIXTURE_DIR/single_workload.json")" 200 ;;
     PUT:*)
         [[ -n "${MOCK_CURL_PUT_DELAY_MS:-}" ]] && \
             sleep "$(awk "BEGIN{print ${MOCK_CURL_PUT_DELAY_MS}/1000}")"
